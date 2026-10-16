@@ -4,6 +4,7 @@ from decimal import Decimal
 from http.client import IncompleteRead
 import io
 import json
+from threading import Event
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
@@ -153,6 +154,55 @@ class HttpTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+class DeadlineTests(unittest.TestCase):
+    def test_successful_operation_returns_value(self):
+        self.assertEqual(monitor.call_with_deadline(lambda: 42, 1), 42)
+
+    def test_operation_exception_is_propagated(self):
+        def fail():
+            raise monitor.RequestFailure("HTTP 503")
+        with self.assertRaises(monitor.RequestFailure):
+            monitor.call_with_deadline(fail, 1)
+
+    def test_blocking_operation_has_a_wall_clock_deadline(self):
+        gate = Event()
+        try:
+            with self.assertRaises(monitor.RequestFailure) as caught:
+                monitor.call_with_deadline(lambda: gate.wait(2), 0.01)
+            self.assertIn("总耗时", caught.exception.reason)
+        finally:
+            gate.set()
+
+    def test_stalled_balance_fetch_still_sends_an_alert(self):
+        gate = Event()
+        def stalled_fetch(config):
+            gate.wait(2)
+            return Decimal("1000")
+        try:
+            with patch("monitor.fetch_balance", side_effect=stalled_fetch):
+                with patch("monitor.BALANCE_DEADLINE_SECONDS", 0.01):
+                    with patch("monitor.send_email") as send:
+                        outcome = monitor.run_monitor(CONFIG)
+            self.assertEqual(outcome, "unavailable-alert")
+            send.assert_called_once()
+            self.assertIn("总耗时", send.call_args.args[2])
+        finally:
+            gate.set()
+
+    def test_stalled_mail_service_returns_failure(self):
+        gate = Event()
+        def stalled_mail(*args, **kwargs):
+            gate.wait(2)
+            return {"id": "test-message"}
+        try:
+            with patch("monitor.request_json", side_effect=stalled_mail):
+                with patch("monitor.EMAIL_DEADLINE_SECONDS", 0.01):
+                    with self.assertRaises(monitor.MailFailure):
+                        monitor.send_email(CONFIG, "test subject", "test text")
+        finally:
+            gate.set()
+
+
 class BalanceTests(unittest.TestCase):
     def test_numeric_balances(self):
         for value in (0, -1, 500, 1.25, Decimal("499.99")):
@@ -177,6 +227,32 @@ class MonitorTests(unittest.TestCase):
                         result = monitor.run_monitor(CONFIG)
                 self.assertEqual(send.call_count, int(should_alert))
                 self.assertEqual(result, "low-balance-alert" if should_alert else "healthy")
+
+    def test_extreme_balances_keep_email_bounded(self):
+        cases = (
+            (Decimal("1e-999999999999999999"), "check"),
+            (Decimal("-1e+999999999999999999"), "check"),
+            (Decimal("1e+999999999999999999"), "test-email"),
+            (Decimal("1." + "0" * 10_000 + "1"), "check"),
+        )
+        for balance, mode in cases:
+            with self.subTest(mode=mode, exponent=balance.as_tuple().exponent):
+                with patch("monitor.fetch_balance", return_value=balance):
+                    with patch("monitor.send_email") as send:
+                        monitor.run_monitor(CONFIG, mode=mode)
+                send.assert_called_once()
+                self.assertLess(len(send.call_args.args[2]), 1000)
+
+    def test_extreme_threshold_keeps_email_bounded(self):
+        config = replace(CONFIG, threshold=Decimal("1e+999999999999999999"))
+        with patch("monitor.fetch_balance", return_value=Decimal("1")):
+            with patch("monitor.send_email") as send:
+                monitor.run_monitor(config)
+        self.assertLess(len(send.call_args.args[2]), 1000)
+
+    def test_regular_number_display_preserves_precision(self):
+        for value in ("1234.56", "499.99", "500", "0", "-1"):
+            self.assertEqual(monitor.display_number(Decimal(value)), value)
 
     def test_custom_threshold(self):
         with patch("monitor.fetch_balance", return_value=Decimal("700")):

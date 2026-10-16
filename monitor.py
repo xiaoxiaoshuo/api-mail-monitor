@@ -10,8 +10,10 @@ from email.utils import parseaddr
 from http.client import HTTPException
 import json
 import os
+from queue import Empty, Queue
 import socket
 import sys
+from threading import Thread
 import time
 from typing import Mapping
 from urllib.error import HTTPError, URLError
@@ -22,6 +24,8 @@ import uuid
 
 RESEND_URL = "https://api.resend.com/emails"
 REQUEST_TIMEOUT_SECONDS = 15
+BALANCE_DEADLINE_SECONDS = 60
+EMAIL_DEADLINE_SECONDS = 60
 MAX_ATTEMPTS = 3
 MAX_RESPONSE_BYTES = 65_536
 BEIJING = timezone(timedelta(hours=8))
@@ -179,6 +183,28 @@ def request_json(url: str, token: str, **kwargs) -> dict:
     raise AssertionError("Unreachable retry state.")
 
 
+def call_with_deadline(operation, timeout_seconds: float):
+    """Bound total wall time, not just socket inactivity (also works on Windows)."""
+    completed = Queue(maxsize=1)
+
+    def worker():
+        try:
+            completed.put((True, operation()))
+        except Exception as error:
+            completed.put((False, error))
+
+    # A stuck socket must not prevent shutdown. A timed-out balance worker
+    # can finish later, but it only reads the API and never sends mail itself.
+    Thread(target=worker, daemon=True).start()
+    try:
+        succeeded, value = completed.get(timeout=timeout_seconds)
+    except Empty:
+        raise RequestFailure("请求超过总耗时限制") from None
+    if not succeeded:
+        raise value
+    return value
+
+
 def fetch_balance(config: Config) -> Decimal:
     result = request_json(config.balance_url, config.balance_token)
     value = result.get("balance")
@@ -198,21 +224,32 @@ def send_email(config: Config, subject: str, text: str) -> None:
     # A new monitoring run deliberately gets a new key: no alert cooldown.
     key = "balance-monitor-" + str(uuid.uuid4())
     try:
-        result = request_json(
-            RESEND_URL,
-            config.resend_key,
-            payload={
-                "from": config.sender,
-                "to": [config.recipient],
-                "subject": subject,
-                "text": text,
-            },
-            idempotency_key=key,
+        result = call_with_deadline(
+            lambda: request_json(
+                RESEND_URL,
+                config.resend_key,
+                payload={
+                    "from": config.sender,
+                    "to": [config.recipient],
+                    "subject": subject,
+                    "text": text,
+                },
+                idempotency_key=key,
+            ),
+            EMAIL_DEADLINE_SECONDS,
         )
     except RequestFailure:
         raise MailFailure("Email service did not accept the message.") from None
     if not isinstance(result.get("id"), str) or not result["id"].strip():
         raise MailFailure("Email service did not return a message ID.")
+
+
+def display_number(value: Decimal) -> str:
+    # Fixed-point formatting of a compact exponent such as 1e-1000000000
+    # can allocate gigabytes. Keep email formatting bounded instead.
+    if -6 <= value.adjusted() <= 12 and value.as_tuple().exponent >= -6:
+        return format(value, "f")
+    return format(value, ".12E")
 
 
 def run_monitor(config: Config, *, mode: str = "check") -> str:
@@ -221,10 +258,10 @@ def run_monitor(config: Config, *, mode: str = "check") -> str:
     checked_at = datetime.now(BEIJING).isoformat(timespec="seconds")
     prefix = (
         f"检查时间（北京时间）：{checked_at}\n"
-        f"报警阈值：剩余积分低于 {config.threshold:f}\n"
+        f"报警阈值：剩余积分低于 {display_number(config.threshold)}\n"
     )
     try:
-        balance = fetch_balance(config)
+        balance = call_with_deadline(lambda: fetch_balance(config), BALANCE_DEADLINE_SECONDS)
     except RequestFailure as error:
         subject = "【余额监控】接口不可用"
         if mode == "test-email":
@@ -244,7 +281,7 @@ def run_monitor(config: Config, *, mode: str = "check") -> str:
             config,
             "【余额监控】工作流测试邮件",
             prefix
-            + f"\n当前剩余积分：{balance:f}\n"
+            + f"\n当前剩余积分：{display_number(balance)}\n"
             + "接口请求成功。这是一次手动测试，不代表定时监控已启用。\n",
         )
         return "test-email"
@@ -254,7 +291,7 @@ def run_monitor(config: Config, *, mode: str = "check") -> str:
             config,
             "【余额监控】剩余积分不足",
             prefix
-            + f"\n当前剩余积分：{balance:f}\n"
+            + f"\n当前剩余积分：{display_number(balance)}\n"
             + "余额已低于阈值，请及时检查账户或补充积分。\n"
             + "只要余额仍低于阈值，每次监控运行都会发送报警。\n",
         )
