@@ -1,0 +1,50 @@
+name: Balance monitor
+
+on:
+  schedule:
+    # Every five minutes, offset from the start of each hour.
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run a check or always send one test email
+        type: choice
+        required: true
+        default: check
+        options:
+          - check
+          - test-email
+
+permissions:
+  contents: read
+
+concurrency:
+  group: balance-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    # Fail closed: scheduled checks remain off until explicitly enabled.
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.MONITOR_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Check balance and send alerts when needed
+        env:
+          BALANCE_API_URL: ${{ secrets.BALANCE_API_URL }}
+          BALANCE_API_TOKEN: ${{ secrets.BALANCE_API_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          BALANCE_THRESHOLD: ${{ vars.BALANCE_THRESHOLD || '500' }}
+          MONITOR_MODE: ${{ inputs.mode || 'check' }}
+          PYTHONUTF8: '1'
+        run: python monitor.py --mode "$MONITOR_MODE"
