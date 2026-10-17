@@ -30,7 +30,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_default_threshold(self):
         env = {key: value for key, value in ENV.items() if key != "BALANCE_THRESHOLD"}
-        self.assertEqual(monitor.read_config(env).threshold, Decimal("500"))
+        self.assertEqual(monitor.read_config(env).threshold, Decimal("1500"))
 
     def test_missing_secrets_fail_closed(self):
         for name in ENV.keys() - {"BALANCE_THRESHOLD"}:
@@ -227,6 +227,28 @@ class MonitorTests(unittest.TestCase):
                         result = monitor.run_monitor(CONFIG)
                 self.assertEqual(send.call_count, int(should_alert))
                 self.assertEqual(result, "low-balance-alert" if should_alert else "healthy")
+
+    def test_production_threshold_1500_is_strict(self):
+        config = monitor.read_config({**ENV, "BALANCE_THRESHOLD": "1500"})
+        for value, should_alert in (("1499.99", True), ("1500", False), ("1500.01", False)):
+            with self.subTest(value=value):
+                with patch("monitor.fetch_balance", return_value=Decimal(value)):
+                    with patch("monitor.send_email") as send:
+                        outcome = monitor.run_monitor(config)
+                self.assertEqual(send.call_count, int(should_alert))
+                self.assertEqual(outcome, "low-balance-alert" if should_alert else "healthy")
+                if should_alert:
+                    self.assertIn("1500", send.call_args.args[2])
+
+    def test_unavailable_endpoint_alerts_with_production_threshold(self):
+        config = monitor.read_config({**ENV, "BALANCE_THRESHOLD": "1500"})
+        with patch("monitor.fetch_balance", side_effect=monitor.RequestFailure("HTTP 503")):
+            with patch("monitor.send_email") as send:
+                outcome = monitor.run_monitor(config)
+        self.assertEqual(outcome, "unavailable-alert")
+        send.assert_called_once()
+        self.assertIn("1500", send.call_args.args[2])
+        self.assertIn("HTTP 503", send.call_args.args[2])
 
     def test_extreme_balances_keep_email_bounded(self):
         cases = (

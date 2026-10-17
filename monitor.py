@@ -103,7 +103,7 @@ def read_config(environ: Mapping[str, str] | None = None) -> Config:
             raise ConfigError("Configure exactly one sender and one recipient.")
 
     try:
-        threshold = Decimal(env.get("BALANCE_THRESHOLD", "500"))
+        threshold = Decimal(env.get("BALANCE_THRESHOLD", "1500"))
         if not threshold.is_finite() or threshold < 0:
             raise InvalidOperation
     except (InvalidOperation, ValueError):
