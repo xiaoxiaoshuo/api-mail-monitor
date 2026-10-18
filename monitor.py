@@ -65,6 +65,8 @@ class Config:
     sender: str
     recipient: str
     threshold: Decimal
+    cooldown_minutes: int = 0
+    state_file: str | None = None
 
 
 def read_config(environ: Mapping[str, str] | None = None) -> Config:
@@ -109,6 +111,13 @@ def read_config(environ: Mapping[str, str] | None = None) -> Config:
     except (InvalidOperation, ValueError):
         raise ConfigError("BALANCE_THRESHOLD must be finite and nonnegative.") from None
 
+    try:
+        cooldown_minutes = int(env.get("ALERT_COOLDOWN_MINUTES", "0").strip() or "0")
+        if cooldown_minutes < 0:
+            raise ValueError
+    except ValueError:
+        raise ConfigError("ALERT_COOLDOWN_MINUTES must be a nonnegative integer.") from None
+
     return Config(
         balance_url=balance_url,
         balance_token=required("BALANCE_API_TOKEN"),
@@ -116,6 +125,8 @@ def read_config(environ: Mapping[str, str] | None = None) -> Config:
         sender=sender,
         recipient=recipient,
         threshold=threshold,
+        cooldown_minutes=cooldown_minutes,
+        state_file=env.get("ALERT_STATE_FILE", "").strip() or None,
     )
 
 
@@ -252,27 +263,96 @@ def display_number(value: Decimal) -> str:
     return format(value, ".12E")
 
 
+def read_state(path):
+    """Read cooldown state; any problem must bias towards sending an alert."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(path, state):
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(temporary, path)
+    except OSError:
+        # A lost state file can only cause an extra alert, never a missed one.
+        pass
+
+
+def within_cooldown(state, kind, now, cooldown_minutes):
+    if cooldown_minutes <= 0:
+        return False
+    if state.get("alert_kind") != kind:
+        return False
+    raw = state.get("last_alert_at")
+    if not isinstance(raw, str):
+        return False
+    try:
+        last_alert = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if last_alert.tzinfo is None:
+        return False
+    return now - last_alert < timedelta(minutes=cooldown_minutes)
+
+
+def repetition_note(config):
+    if config.cooldown_minutes > 0:
+        return (
+            f"异常持续期间最多每 {config.cooldown_minutes} 分钟提醒一次，"
+            "恢复正常时会再发一封恢复通知。\n"
+        )
+    return "异常持续时，每次监控运行都会发送报警，不做去重。\n"
+
+
 def run_monitor(config: Config, *, mode: str = "check") -> str:
     if mode not in ("check", "test-email"):
         raise ConfigError("Unknown monitor mode.")
-    checked_at = datetime.now(BEIJING).isoformat(timespec="seconds")
+    now = datetime.now(BEIJING)
+    checked_at = now.isoformat(timespec="seconds")
     prefix = (
         f"检查时间（北京时间）：{checked_at}\n"
         f"报警阈值：剩余积分低于 {display_number(config.threshold)}\n"
     )
+    state = read_state(config.state_file)
+
     try:
         balance = call_with_deadline(lambda: fetch_balance(config), BALANCE_DEADLINE_SECONDS)
     except RequestFailure as error:
-        subject = "【余额监控】接口不可用"
         if mode == "test-email":
-            subject = "【余额监控】测试邮件：接口不可用"
+            send_email(
+                config,
+                "【余额监控】测试邮件：接口不可用",
+                prefix
+                + f"\n本次无法读取剩余积分。原因：{error.reason}\n"
+                + "超时、网络错误、限流和服务端错误会先进行有限次数重试。\n",
+            )
+            return "unavailable-alert"
+        if within_cooldown(state, "unavailable", now, config.cooldown_minutes):
+            return "alert-suppressed"
         send_email(
             config,
-            subject,
+            "【余额监控】接口不可用",
             prefix
             + f"\n本次无法读取剩余积分。原因：{error.reason}\n"
             + "超时、网络错误、限流和服务端错误会先进行有限次数重试。\n"
-            + "异常持续时，每次监控运行都会发送报警，不做去重。\n",
+            + repetition_note(config),
+        )
+        write_state(
+            config.state_file,
+            {"alert_kind": "unavailable", "active": True, "last_alert_at": checked_at},
         )
         return "unavailable-alert"
 
@@ -287,15 +367,33 @@ def run_monitor(config: Config, *, mode: str = "check") -> str:
         return "test-email"
 
     if balance < config.threshold:
+        if within_cooldown(state, "low-balance", now, config.cooldown_minutes):
+            return "alert-suppressed"
         send_email(
             config,
             "【余额监控】剩余积分不足",
             prefix
             + f"\n当前剩余积分：{display_number(balance)}\n"
             + "余额已低于阈值，请及时检查账户或补充积分。\n"
-            + "只要余额仍低于阈值，每次监控运行都会发送报警。\n",
+            + repetition_note(config),
+        )
+        write_state(
+            config.state_file,
+            {"alert_kind": "low-balance", "active": True, "last_alert_at": checked_at},
         )
         return "low-balance-alert"
+
+    if state.get("active"):
+        send_email(
+            config,
+            "【余额监控】已恢复正常",
+            prefix
+            + f"\n当前剩余积分：{display_number(balance)}\n"
+            + "余额已回到阈值以上，报警状态解除。\n",
+        )
+        write_state(config.state_file, {})
+        return "recovery-alert"
+
     return "healthy"
 
 
@@ -319,6 +417,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if outcome == "healthy":
         print("Check completed; no alert needed.")
+    elif outcome == "alert-suppressed":
+        print("Check completed; alert suppressed by cooldown.")
+    elif outcome == "recovery-alert":
+        print("Recovery notice accepted by email service.")
     elif outcome == "test-email":
         print("Test email accepted by email service.")
     else:

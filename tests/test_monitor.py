@@ -1,10 +1,13 @@
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.client import IncompleteRead
 import io
 import json
+import os
 from threading import Event
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
@@ -325,6 +328,128 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaises(monitor.ConfigError):
                 monitor.run_monitor(CONFIG, mode="other")
         fetch.assert_not_called()
+
+
+class CooldownTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.state_file = os.path.join(self.directory.name, 'state.json')
+        self.config = replace(CONFIG, cooldown_minutes=60, state_file=self.state_file)
+
+    def write_last_alert(self, kind, minutes_ago):
+        moment = datetime.now(monitor.BEIJING) - timedelta(minutes=minutes_ago)
+        with open(self.state_file, 'w', encoding='utf-8') as handle:
+            json.dump({'alert_kind': kind, 'active': True, 'last_alert_at': moment.isoformat(timespec='seconds')}, handle)
+
+    def test_first_low_balance_alert_is_sent(self):
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(self.config)
+        self.assertEqual(outcome, 'low-balance-alert')
+        send.assert_called_once()
+
+    def test_repeat_within_cooldown_is_suppressed(self):
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                monitor.run_monitor(self.config)
+                second = monitor.run_monitor(self.config)
+        self.assertEqual(second, 'alert-suppressed')
+        self.assertEqual(send.call_count, 1)
+
+    def test_unavailable_repeats_are_suppressed_too(self):
+        with patch('monitor.fetch_balance', side_effect=monitor.RequestFailure('HTTP 503')):
+            with patch('monitor.send_email') as send:
+                monitor.run_monitor(self.config)
+                second = monitor.run_monitor(self.config)
+        self.assertEqual(second, 'alert-suppressed')
+        self.assertEqual(send.call_count, 1)
+
+    def test_alert_resent_after_cooldown_expires(self):
+        self.write_last_alert('low-balance', 61)
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(self.config)
+        self.assertEqual(outcome, 'low-balance-alert')
+        send.assert_called_once()
+
+    def test_changed_alert_kind_bypasses_cooldown(self):
+        self.write_last_alert('low-balance', 1)
+        with patch('monitor.fetch_balance', side_effect=monitor.RequestFailure('HTTP 503')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(self.config)
+        self.assertEqual(outcome, 'unavailable-alert')
+        send.assert_called_once()
+
+    def test_recovery_notice_sent_once(self):
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email'):
+                monitor.run_monitor(self.config)
+        with patch('monitor.fetch_balance', return_value=Decimal('5000')):
+            with patch('monitor.send_email') as send:
+                first = monitor.run_monitor(self.config)
+                second = monitor.run_monitor(self.config)
+        self.assertEqual(first, 'recovery-alert')
+        self.assertEqual(second, 'healthy')
+        self.assertEqual(send.call_count, 1)
+        self.assertIn('已恢复正常', send.call_args.args[1])
+
+    def test_healthy_without_prior_alert_sends_nothing(self):
+        with patch('monitor.fetch_balance', return_value=Decimal('5000')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(self.config)
+        self.assertEqual(outcome, 'healthy')
+        send.assert_not_called()
+
+    def test_corrupt_state_still_alerts(self):
+        with open(self.state_file, 'w', encoding='utf-8') as handle:
+            handle.write('not json')
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(self.config)
+        self.assertEqual(outcome, 'low-balance-alert')
+        send.assert_called_once()
+
+    def test_unwritable_state_still_alerts(self):
+        blocker = os.path.join(self.directory.name, 'blocker')
+        with open(blocker, 'w', encoding='utf-8') as handle:
+            handle.write('x')
+        config = replace(self.config, state_file=os.path.join(blocker, 'state.json'))
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(config)
+        self.assertEqual(outcome, 'low-balance-alert')
+        send.assert_called_once()
+
+    def test_zero_cooldown_alerts_every_run(self):
+        config = replace(self.config, cooldown_minutes=0)
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email') as send:
+                monitor.run_monitor(config)
+                monitor.run_monitor(config)
+        self.assertEqual(send.call_count, 2)
+
+    def test_no_state_file_disables_recovery(self):
+        config = replace(self.config, state_file=None)
+        with patch('monitor.fetch_balance', return_value=Decimal('100')):
+            with patch('monitor.send_email'):
+                monitor.run_monitor(config)
+        with patch('monitor.fetch_balance', return_value=Decimal('5000')):
+            with patch('monitor.send_email') as send:
+                outcome = monitor.run_monitor(config)
+        self.assertEqual(outcome, 'healthy')
+        send.assert_not_called()
+
+    def test_invalid_cooldown_configuration(self):
+        for value in ('-1', 'abc', '1.5'):
+            with self.subTest(value=value):
+                with self.assertRaises(monitor.ConfigError):
+                    monitor.read_config({**ENV, 'ALERT_COOLDOWN_MINUTES': value})
+
+    def test_cooldown_and_state_file_parsed(self):
+        config = monitor.read_config({**ENV, 'ALERT_COOLDOWN_MINUTES': '60', 'ALERT_STATE_FILE': ' /tmp/state.json '})
+        self.assertEqual(config.cooldown_minutes, 60)
+        self.assertEqual(config.state_file, '/tmp/state.json')
 
 
 class MailTests(unittest.TestCase):
