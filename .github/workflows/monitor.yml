@@ -1,9 +1,6 @@
-name: Balance monitor
+name: Legacy Balance monitor (manual only)
 
 on:
-  schedule:
-    # Every five minutes; GitHub scheduling is best effort, not a timer SLA.
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -25,7 +22,7 @@ concurrency:
 jobs:
   monitor:
     # Fail closed: scheduled checks remain off until explicitly enabled.
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.MONITOR_ENABLED == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
