@@ -59,7 +59,8 @@ class RunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = directory + "/report.json"
             monitor.write_report(report, path)
-            loaded = json.load(open(path, encoding="utf-8"))
+            with open(path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
             self.assertFalse(loaded["alert"])
 
 
